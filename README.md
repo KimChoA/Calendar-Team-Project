@@ -586,26 +586,6 @@ MOBLE_SMTP_APP_PASSWORD
 
 ---
 
-# 🚀 빌드 및 실행
-
-## 1. 개발 환경
-
-- Windows
-- Visual Studio 2022
-- C# WinForms
-- MySQL
-
-## 2. 실행 방법
-
-1. 필요한 환경 변수를 설정합니다.
-2. MySQL 데이터베이스 환경을 구성합니다.
-3. `Moble_Team_Project.sln`을 Visual Studio에서 엽니다.
-4. 필요한 NuGet 패키지를 복원합니다.
-5. 프로젝트를 빌드합니다.
-6. 프로그램을 실행합니다.
-
----
-
 # 🎯 핵심 성과
 
 본 프로젝트를 통해 다음 내용을 실제로 구현하고 경험했습니다.
