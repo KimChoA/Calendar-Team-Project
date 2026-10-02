@@ -1,0 +1,2114 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Reflection;
+using System.Windows.Forms;
+using calendar4.Services;
+
+// [포트폴리오 담당] 캘린더 연동형 스터디 플래너
+// - 선택 날짜 기준 체크리스트/시간표 데이터 조회 및 저장
+// - 10분 단위 학습 시간 블록 표시, 오늘의 공부시간 자동 계산
+// - 테마/글꼴 변경 시 레이아웃이 깨지지 않도록 별도 적용 로직 구성
+
+namespace calendar4
+{
+    public partial class PlannerControl : UserControl
+    {
+        private DateTime currentDate = DateTime.Today;
+
+        private Dictionary<string, PlannerData> plannerMap =
+            new Dictionary<string, PlannerData>();
+
+        private readonly int loggedInUserId;
+
+        private readonly PlannerDbRepository plannerDbRepository = new();
+
+        private bool isLoading = false;
+
+
+        public PlannerControl(int userId)
+        {
+            loggedInUserId = userId;
+
+            InitializeComponent();
+        }
+
+
+        // ============================================================
+        // 플래너 로드
+        // ============================================================
+        private void PlannerControl_Load(object sender, EventArgs e)
+        {
+            // 체크리스트 파란색 선택 하이라이트 방지
+            if (dgvTodoList != null)
+            {
+                dgvTodoList.CellPainting -= DgvTodoList_CellPainting;
+                dgvTodoList.CellPainting += DgvTodoList_CellPainting;
+
+                dgvTodoList.DefaultCellStyle.SelectionBackColor =
+                    dgvTodoList.DefaultCellStyle.BackColor;
+
+                dgvTodoList.DefaultCellStyle.SelectionForeColor =
+                    dgvTodoList.DefaultCellStyle.ForeColor;
+            }
+
+            InitTimeTableGrid();
+
+            try
+            {
+                // 로그인 사용자의 플래너 전체 조회
+                plannerMap =
+                    plannerDbRepository.Load(loggedInUserId);
+
+                // 오늘 날짜 데이터 표시
+                LoadPlannerDate(currentDate);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    $"플래너를 DB에서 불러오지 못했습니다.\n\n{ex.Message}",
+                    "DB 불러오기 오류",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+
+                plannerMap =
+                    new Dictionary<string, PlannerData>();
+
+                ClearPlannerScreen();
+            }
+
+            // 형광펜 색상 콤보박스를 현재 테마에 맞게 초기화
+            InitializeHighlightColorCombo();
+
+            // 현재 선택된 테마 적용
+            ApplyCurrentTheme();
+
+            // 현재 선택된 글꼴 적용
+            ApplyCurrentFont();
+        }
+
+
+        // ============================================================
+        // 날짜 변경
+        // ============================================================
+        // [담당 기능] 캘린더에서 선택한 날짜를 플래너의 단일 기준 날짜로 동기화
+        public void SetDate(DateTime date)
+        {
+            date = date.Date;
+
+            if (currentDate == date && !isLoading)
+                return;
+
+            if (!isLoading)
+                SaveCurrentPlanner();
+
+            currentDate = date;
+
+            LoadPlannerDate(currentDate);
+        }
+
+
+        // ============================================================
+        // 체크리스트 셀 렌더링
+        // 선택 파란색 배경을 없애고 테마 배경색 사용
+        // ============================================================
+        private void DgvTodoList_CellPainting(
+            object sender,
+            DataGridViewCellPaintingEventArgs e)
+        {
+            if (e.RowIndex < 0)
+                return;
+
+            DataGridViewPaintParts paintParts =
+                e.PaintParts &
+                ~DataGridViewPaintParts.SelectionBackground;
+
+            using (SolidBrush bgBrush =
+                   new SolidBrush(
+                       dgvTodoList.DefaultCellStyle.BackColor))
+            {
+                e.Graphics.FillRectangle(
+                    bgBrush,
+                    e.CellBounds);
+            }
+
+            e.Paint(
+                e.CellBounds,
+                paintParts);
+
+            e.Handled = true;
+        }
+
+
+        // ============================================================
+        // 스터디 타임테이블 초기화
+        // ============================================================
+        private void InitTimeTableGrid()
+        {
+            if (dgvTimeTable == null)
+                return;
+
+            dgvTimeTable.Size =
+                new Size(219, 490);
+
+            dgvTimeTable.ScrollBars =
+                ScrollBars.None;
+
+            dgvTimeTable.BorderStyle =
+                BorderStyle.FixedSingle;
+
+            dgvTimeTable.Columns.Clear();
+            dgvTimeTable.Rows.Clear();
+
+            dgvTimeTable.AllowUserToAddRows =
+                false;
+
+            dgvTimeTable.RowHeadersVisible =
+                false;
+
+            dgvTimeTable.ColumnHeadersVisible =
+                false;
+
+
+            // 너비 계산
+            int timeColWidth = 33;
+
+            int minuteColWidth =
+                (dgvTimeTable.Width - timeColWidth) / 6;
+
+
+            var timeCol =
+                new DataGridViewTextBoxColumn
+                {
+                    Width = timeColWidth,
+                    ReadOnly = true
+                };
+
+            dgvTimeTable.Columns.Add(timeCol);
+
+
+            for (int i = 0; i < 6; i++)
+            {
+                var minCol =
+                    new DataGridViewTextBoxColumn
+                    {
+                        Width = minuteColWidth,
+                        ReadOnly = true
+                    };
+
+                dgvTimeTable.Columns.Add(minCol);
+            }
+
+
+            // 7시 ~ 24시, 1시 ~ 2시
+            int[] displayHours =
+            {
+                7, 8, 9, 10, 11, 12,
+                1, 2, 3, 4, 5, 6,
+                7, 8, 9, 10, 11, 12,
+                1, 2
+            };
+
+
+            int rowHeight =
+                dgvTimeTable.Height /
+                displayHours.Length;
+
+
+            for (
+                int idx = 0;
+                idx < displayHours.Length;
+                idx++)
+            {
+                int rIdx =
+                    dgvTimeTable.Rows.Add();
+
+                dgvTimeTable.Rows[rIdx].Height =
+                    rowHeight;
+
+                dgvTimeTable.Rows[rIdx]
+                    .Cells[0]
+                    .Value =
+                    displayHours[idx].ToString();
+
+
+                int realHour =
+                    (idx + 7) % 24;
+
+
+                dgvTimeTable.Rows[rIdx].Tag =
+                    new RowTimeInfo
+                    {
+                        RealHour = realHour,
+
+                        Blocks =
+                            new List<TimeBlock>()
+                    };
+            }
+
+
+            dgvTimeTable.CellPainting -=
+                DgvTimeTable_CellPainting;
+
+            dgvTimeTable.CellPainting +=
+                DgvTimeTable_CellPainting;
+
+
+            dgvTimeTable.ClearSelection();
+        }
+
+
+        // ============================================================
+        // 타임테이블 직접 그리기
+        // ============================================================
+        private void DgvTimeTable_CellPainting(
+            object sender,
+            DataGridViewCellPaintingEventArgs e)
+        {
+            if (e.RowIndex < 0)
+                return;
+
+
+            // --------------------------------------------------------
+            // 0번 열 : 시간
+            // --------------------------------------------------------
+            if (e.ColumnIndex == 0)
+            {
+                using (SolidBrush backgroundBrush =
+                       new SolidBrush(
+                           UiThemeService.SurfaceColor))
+                {
+                    e.Graphics.FillRectangle(
+                        backgroundBrush,
+                        e.CellBounds);
+                }
+
+
+                TextRenderer.DrawText(
+                    e.Graphics,
+                    e.Value?.ToString() ?? "",
+                    dgvTimeTable.Font,
+                    e.CellBounds,
+                    UiThemeService.TextColor,
+                    TextFormatFlags.HorizontalCenter |
+                    TextFormatFlags.VerticalCenter);
+
+
+                using (Pen pen =
+                       new Pen(GetPlannerGridColor()))
+                {
+                    e.Graphics.DrawLine(
+                        pen,
+                        e.CellBounds.Right - 1,
+                        e.CellBounds.Top,
+                        e.CellBounds.Right - 1,
+                        e.CellBounds.Bottom);
+
+                    e.Graphics.DrawLine(
+                        pen,
+                        e.CellBounds.Left,
+                        e.CellBounds.Bottom - 1,
+                        e.CellBounds.Right,
+                        e.CellBounds.Bottom - 1);
+                }
+
+
+                e.Handled = true;
+
+                return;
+            }
+
+
+            // --------------------------------------------------------
+            // 1 ~ 6 : 10분 단위 시간 영역
+            // --------------------------------------------------------
+            if (e.ColumnIndex >= 1 &&
+                e.ColumnIndex <= 6)
+            {
+                using (SolidBrush bgBrush =
+                       new SolidBrush(
+                           dgvTimeTable
+                               .DefaultCellStyle
+                               .BackColor))
+                {
+                    e.Graphics.FillRectangle(
+                        bgBrush,
+                        e.CellBounds);
+                }
+
+
+                var rowInfo =
+                    dgvTimeTable
+                        .Rows[e.RowIndex]
+                        .Tag as RowTimeInfo;
+
+
+                int slotIndex =
+                    e.ColumnIndex - 1;
+
+
+                if (rowInfo != null &&
+                    rowInfo.Blocks != null &&
+                    rowInfo.Blocks.Count > 0)
+                {
+                    foreach (
+                        var block
+                        in rowInfo.Blocks)
+                    {
+                        int slotStartMin =
+                            slotIndex * 10;
+
+                        int slotEndMin =
+                            (slotIndex + 1) * 10;
+
+
+                        if (block.StartMinute < slotEndMin &&
+                            block.EndMinute > slotStartMin)
+                        {
+                            Rectangle fillRect =
+                                new Rectangle(
+                                    e.CellBounds.X,
+                                    e.CellBounds.Y + 1,
+                                    e.CellBounds.Width,
+                                    e.CellBounds.Height - 2);
+
+
+                            // DB에 저장된 기존 RGB는 그대로 두고,
+                            // 화면에 표시할 때만 현재 테마의 형광펜 색으로 변환
+                            Color themedHighlight =
+                                GetThemedHighlightColor(
+                                    Color.FromArgb(
+                                        block.R,
+                                        block.G,
+                                        block.B));
+
+                            using (SolidBrush brush =
+                                   new SolidBrush(
+                                       Color.FromArgb(
+                                           200,
+                                           themedHighlight)))
+                            {
+                                e.Graphics.FillRectangle(
+                                    brush,
+                                    fillRect);
+                            }
+
+
+                            if (
+                                slotIndex ==
+                                block.StartMinute / 10 &&
+                                !string.IsNullOrEmpty(
+                                    block.TaskName))
+                            {
+                                TextRenderer.DrawText(
+                                    e.Graphics,
+                                    block.TaskName,
+                                    dgvTimeTable.Font,
+                                    new Rectangle(
+                                        fillRect.X + 2,
+                                        fillRect.Y,
+                                        100,
+                                        fillRect.Height),
+
+                                    GetTimeBlockTextColor(),
+
+                                    TextFormatFlags.VerticalCenter |
+                                    TextFormatFlags.Left);
+                            }
+                        }
+                    }
+                }
+
+
+                // 테마에 맞는 격자선
+                using (Pen gridPen =
+                       new Pen(
+                           GetPlannerGridColor()))
+                {
+                    e.Graphics.DrawRectangle(
+                        gridPen,
+                        e.CellBounds.X,
+                        e.CellBounds.Y,
+                        e.CellBounds.Width - 1,
+                        e.CellBounds.Height - 1);
+                }
+
+
+                e.Handled = true;
+            }
+        }
+
+
+        // ============================================================
+        // 총 공부시간
+        // ============================================================
+        // [담당 기능] 채워진 10분 단위 시간 블록을 합산해 오늘의 공부시간 자동 계산
+        private void UpdateTotalStudyTime()
+        {
+            if (lblStudyTimeValue == null ||
+                dgvTimeTable == null)
+            {
+                return;
+            }
+
+
+            int totalMinutes = 0;
+
+
+            for (
+                int i = 0;
+                i < dgvTimeTable.Rows.Count;
+                i++)
+            {
+                var rowInfo =
+                    dgvTimeTable.Rows[i].Tag
+                    as RowTimeInfo;
+
+
+                if (rowInfo != null &&
+                    rowInfo.Blocks != null)
+                {
+                    foreach (
+                        var block
+                        in rowInfo.Blocks)
+                    {
+                        int duration =
+                            block.EndMinute -
+                            block.StartMinute;
+
+
+                        if (duration > 0)
+                        {
+                            totalMinutes += duration;
+                        }
+                    }
+                }
+            }
+
+
+            int hours =
+                totalMinutes / 60;
+
+            int minutes =
+                totalMinutes % 60;
+
+
+            lblStudyTimeValue.Text =
+                $"{hours}H {minutes}M";
+        }
+
+
+        // ============================================================
+        // 화면 초기화
+        // ============================================================
+        public void ClearPlannerScreen()
+        {
+            if (dgvTodoList != null)
+            {
+                dgvTodoList.Rows.Clear();
+
+                dgvTodoList.ClearSelection();
+            }
+
+
+            if (cbTaskList != null)
+            {
+                cbTaskList.Items.Clear();
+            }
+
+
+            if (dgvTimeTable != null)
+            {
+                for (
+                    int i = 0;
+                    i < dgvTimeTable.Rows.Count;
+                    i++)
+                {
+                    var rowInfo =
+                        dgvTimeTable.Rows[i].Tag
+                        as RowTimeInfo;
+
+
+                    if (rowInfo != null)
+                    {
+                        rowInfo.Blocks.Clear();
+                    }
+                }
+
+
+                dgvTimeTable.ClearSelection();
+
+                dgvTimeTable.Invalidate();
+            }
+
+
+            UpdateTotalStudyTime();
+        }
+
+
+        // ============================================================
+        // 형광펜 칠하기
+        // ============================================================
+        private void btnFillTime_Click(
+            object sender,
+            EventArgs e)
+        {
+            if (dtpStart == null ||
+                dtpEnd == null ||
+                dgvTimeTable == null)
+            {
+                return;
+            }
+
+
+            DateTime start =
+                dtpStart.Value;
+
+            DateTime end =
+                dtpEnd.Value;
+
+
+            if (start >= end)
+            {
+                MessageBox.Show(
+                    "종료 시간이 시작 시간보다 늦어야 합니다!",
+                    "안내",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+
+                return;
+            }
+
+
+            // ============================================================
+            // 추가하려는 시간과 기존 항목의 시간이 겹치는지 먼저 확인
+            // 하나라도 겹치면 기존 항목을 건드리지 않고 추가 취소
+            // ============================================================
+            for (
+                int i = 0;
+                i < dgvTimeTable.Rows.Count;
+                i++)
+            {
+                var rowInfo =
+                    dgvTimeTable.Rows[i].Tag
+                    as RowTimeInfo;
+
+
+                if (rowInfo == null)
+                    continue;
+
+
+                int h =
+                    rowInfo.RealHour;
+
+
+                bool isInRange;
+
+
+                if (start.Hour <= end.Hour)
+                {
+                    isInRange =
+                        h >= start.Hour &&
+                        h <= end.Hour;
+                }
+                else
+                {
+                    isInRange =
+                        h >= start.Hour ||
+                        h <= end.Hour;
+                }
+
+
+                if (!isInRange)
+                    continue;
+
+
+                int segStartMin =
+                    h == start.Hour
+                        ? start.Minute
+                        : 0;
+
+
+                int segEndMin =
+                    h == end.Hour
+                        ? end.Minute
+                        : 60;
+
+
+                if (
+                    segStartMin >= segEndMin &&
+                    h == end.Hour)
+                {
+                    continue;
+                }
+
+
+                bool overlaps =
+                    rowInfo.Blocks.Any(
+                        b =>
+                            b.StartMinute < segEndMin &&
+                            b.EndMinute > segStartMin);
+
+
+                if (overlaps)
+                {
+                    MessageBox.Show(
+                        "선택한 시간에 이미 등록된 항목이 있습니다.\n겹치지 않는 시간을 선택해주세요.",
+                        "시간 중복",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+
+                    return;
+                }
+            }
+
+
+            // 콤보박스의 0~4 인덱스를 기준으로
+            // DB에는 기존 5색 RGB를 저장한다.
+            int selectedColorIndex =
+                cbColorPicker != null
+                    ? cbColorPicker.SelectedIndex
+                    : 0;
+
+            if (selectedColorIndex < 0 ||
+                selectedColorIndex > 4)
+            {
+                selectedColorIndex = 0;
+            }
+
+            Color highlightColor =
+                GetBaseHighlightColor(
+                    selectedColorIndex);
+
+
+            string selectedTask =
+                cbTaskList != null &&
+                cbTaskList.SelectedItem != null
+                    ? cbTaskList
+                        .SelectedItem
+                        .ToString()
+                    : "";
+
+
+            for (
+                int i = 0;
+                i < dgvTimeTable.Rows.Count;
+                i++)
+            {
+                var rowInfo =
+                    dgvTimeTable.Rows[i].Tag
+                    as RowTimeInfo;
+
+
+                if (rowInfo == null)
+                    continue;
+
+
+                int h =
+                    rowInfo.RealHour;
+
+
+                bool isInRange;
+
+
+                if (start.Hour <= end.Hour)
+                {
+                    isInRange =
+                        h >= start.Hour &&
+                        h <= end.Hour;
+                }
+                else
+                {
+                    isInRange =
+                        h >= start.Hour ||
+                        h <= end.Hour;
+                }
+
+
+                if (isInRange)
+                {
+                    int segStartMin =
+                        h == start.Hour
+                            ? start.Minute
+                            : 0;
+
+
+                    int segEndMin =
+                        h == end.Hour
+                            ? end.Minute
+                            : 60;
+
+
+                    if (
+                        segStartMin >= segEndMin &&
+                        h == end.Hour)
+                    {
+                        continue;
+                    }
+
+
+                    rowInfo.Blocks.Add(
+                        new TimeBlock
+                        {
+                            StartMinute =
+                                segStartMin,
+
+                            EndMinute =
+                                segEndMin,
+
+                            TaskName =
+                                selectedTask,
+
+                            R =
+                                highlightColor.R,
+
+                            G =
+                                highlightColor.G,
+
+                            B =
+                                highlightColor.B
+                        });
+                }
+            }
+
+
+            dgvTimeTable.ClearSelection();
+
+            dgvTimeTable.Invalidate();
+
+            SaveCurrentPlanner();
+
+            UpdateTotalStudyTime();
+        }
+
+
+        // ============================================================
+        // 선택 영역 지우기
+        // ============================================================
+        private void btnClearTime_Click_Click(
+            object sender,
+            EventArgs e)
+        {
+            if (dtpStart == null ||
+                dtpEnd == null ||
+                dgvTimeTable == null)
+            {
+                return;
+            }
+
+
+            DateTime start =
+                dtpStart.Value;
+
+            DateTime end =
+                dtpEnd.Value;
+
+
+            for (
+                int i = 0;
+                i < dgvTimeTable.Rows.Count;
+                i++)
+            {
+                var rowInfo =
+                    dgvTimeTable.Rows[i].Tag
+                    as RowTimeInfo;
+
+
+                if (rowInfo == null)
+                    continue;
+
+
+                int h =
+                    rowInfo.RealHour;
+
+
+                bool isInRange;
+
+
+                if (start.Hour <= end.Hour)
+                {
+                    isInRange =
+                        h >= start.Hour &&
+                        h <= end.Hour;
+                }
+                else
+                {
+                    isInRange =
+                        h >= start.Hour ||
+                        h <= end.Hour;
+                }
+
+
+                if (isInRange)
+                {
+                    int segStartMin =
+                        h == start.Hour
+                            ? start.Minute
+                            : 0;
+
+
+                    int segEndMin =
+                        h == end.Hour
+                            ? end.Minute
+                            : 60;
+
+
+                    rowInfo.Blocks.RemoveAll(
+                        b =>
+                            b.StartMinute < segEndMin &&
+                            b.EndMinute > segStartMin);
+                }
+            }
+
+
+            dgvTimeTable.ClearSelection();
+
+            dgvTimeTable.Invalidate();
+
+            SaveCurrentPlanner();
+
+            UpdateTotalStudyTime();
+        }
+
+
+        // ============================================================
+        // 할 일 추가
+        // ============================================================
+        private void btnAddTask_Click(
+            object sender,
+            EventArgs e)
+        {
+            if (txtTaskInput == null ||
+                dgvTodoList == null)
+            {
+                return;
+            }
+
+
+            string taskName =
+                txtTaskInput.Text.Trim();
+
+
+            if (!string.IsNullOrWhiteSpace(taskName))
+            {
+                dgvTodoList.Rows.Add(
+                    false,
+                    taskName);
+
+
+                if (cbTaskList != null)
+                {
+                    if (!cbTaskList.Items.Contains(taskName))
+                    {
+                        cbTaskList.Items.Add(taskName);
+                    }
+
+
+                    cbTaskList.SelectedItem =
+                        taskName;
+                }
+
+
+                txtTaskInput.Clear();
+
+                txtTaskInput.Focus();
+
+                dgvTodoList.ClearSelection();
+
+                SaveCurrentPlanner();
+            }
+        }
+
+
+        // ============================================================
+        // 할 일 삭제
+        // ============================================================
+        private void btnDeleteTask_Click_Click(
+            object sender,
+            EventArgs e)
+        {
+            if (dgvTodoList == null)
+                return;
+
+
+            List<DataGridViewRow> toDelete =
+                new List<DataGridViewRow>();
+
+
+            foreach (
+                DataGridViewCell cell
+                in dgvTodoList.SelectedCells)
+            {
+                if (
+                    cell.RowIndex >= 0 &&
+                    !dgvTodoList
+                        .Rows[cell.RowIndex]
+                        .IsNewRow)
+                {
+                    var row =
+                        dgvTodoList
+                            .Rows[cell.RowIndex];
+
+
+                    if (!toDelete.Contains(row))
+                    {
+                        toDelete.Add(row);
+                    }
+                }
+            }
+
+
+            foreach (var row in toDelete)
+            {
+                string name =
+                    row.Cells[1]
+                        .Value?
+                        .ToString();
+
+
+                if (
+                    !string.IsNullOrEmpty(name) &&
+                    cbTaskList != null)
+                {
+                    cbTaskList.Items.Remove(name);
+                }
+
+
+                dgvTodoList.Rows.Remove(row);
+            }
+
+
+            dgvTodoList.ClearSelection();
+
+            SaveCurrentPlanner();
+        }
+
+
+        // ============================================================
+        // 날짜 데이터 불러오기
+        // ============================================================
+        // [담당 기능] 날짜 변경 시 해당 날짜의 체크리스트/시간표 데이터를 함께 갱신
+        private void LoadPlannerDate(DateTime date)
+        {
+            isLoading = true;
+
+
+            try
+            {
+                ClearPlannerScreen();
+
+
+                string key =
+                    date.ToString(
+                        "yyyy-MM-dd");
+
+
+                if (!plannerMap.ContainsKey(key))
+                    return;
+
+
+                PlannerData data =
+                    plannerMap[key];
+
+
+                // 체크리스트
+                if (dgvTodoList != null)
+                {
+                    foreach (
+                        var task
+                        in data.Tasks)
+                    {
+                        dgvTodoList.Rows.Add(
+                            task.Completed,
+                            task.Name);
+                    }
+
+
+                    dgvTodoList.ClearSelection();
+                }
+
+
+                // 할 일 ComboBox
+                if (cbTaskList != null)
+                {
+                    foreach (
+                        var task
+                        in data.Tasks)
+                    {
+                        if (
+                            !string.IsNullOrWhiteSpace(
+                                task.Name) &&
+                            !cbTaskList.Items.Contains(
+                                task.Name))
+                        {
+                            cbTaskList.Items.Add(
+                                task.Name);
+                        }
+                    }
+
+
+                    if (cbTaskList.Items.Count > 0)
+                    {
+                        cbTaskList.SelectedIndex = 0;
+                    }
+                }
+
+
+                // 타임테이블
+                if (dgvTimeTable != null)
+                {
+                    foreach (
+                        var slot
+                        in data.TimeSlots)
+                    {
+                        for (
+                            int i = 0;
+                            i < dgvTimeTable.Rows.Count;
+                            i++)
+                        {
+                            var rowInfo =
+                                dgvTimeTable
+                                    .Rows[i]
+                                    .Tag
+                                    as RowTimeInfo;
+
+
+                            if (
+                                rowInfo != null &&
+                                rowInfo.RealHour ==
+                                slot.Hour)
+                            {
+                                int start = 0;
+                                int end = 0;
+
+
+                                try
+                                {
+                                    start =
+                                        Convert.ToInt32(
+                                            slot
+                                                .GetType()
+                                                .GetProperty(
+                                                    "StartMinute")
+                                                ?.GetValue(
+                                                    slot));
+                                }
+                                catch
+                                {
+                                }
+
+
+                                try
+                                {
+                                    end =
+                                        Convert.ToInt32(
+                                            slot
+                                                .GetType()
+                                                .GetProperty(
+                                                    "EndMinute")
+                                                ?.GetValue(
+                                                    slot));
+                                }
+                                catch
+                                {
+                                }
+
+
+                                if (
+                                    start == 0 &&
+                                    end == 0)
+                                {
+                                    try
+                                    {
+                                        start =
+                                            Convert.ToInt32(
+                                                slot
+                                                    .GetType()
+                                                    .GetProperty(
+                                                        "StartMin")
+                                                    ?.GetValue(
+                                                        slot));
+                                    }
+                                    catch
+                                    {
+                                    }
+
+
+                                    try
+                                    {
+                                        end =
+                                            Convert.ToInt32(
+                                                slot
+                                                    .GetType()
+                                                    .GetProperty(
+                                                        "EndMin")
+                                                    ?.GetValue(
+                                                        slot));
+                                    }
+                                    catch
+                                    {
+                                    }
+                                }
+
+
+                                rowInfo.Blocks.Add(
+                                    new TimeBlock
+                                    {
+                                        StartMinute =
+                                            start,
+
+                                        EndMinute =
+                                            end,
+
+                                        TaskName =
+                                            slot.TaskName,
+
+                                        R =
+                                            slot.R,
+
+                                        G =
+                                            slot.G,
+
+                                        B =
+                                            slot.B
+                                    });
+                            }
+                        }
+                    }
+
+
+                    dgvTimeTable.ClearSelection();
+
+                    dgvTimeTable.Invalidate();
+                }
+
+
+                UpdateTotalStudyTime();
+            }
+
+            finally
+            {
+                isLoading = false;
+            }
+        }
+
+
+        // ============================================================
+        // 플래너 DB 저장
+        // ============================================================
+        private void SaveCurrentPlanner()
+        {
+            if (isLoading)
+                return;
+
+
+            string key =
+                currentDate.ToString(
+                    "yyyy-MM-dd");
+
+
+            PlannerData data =
+                new PlannerData();
+
+
+            // 체크리스트 저장
+            if (dgvTodoList != null)
+            {
+                foreach (
+                    DataGridViewRow row
+                    in dgvTodoList.Rows)
+                {
+                    if (row.IsNewRow)
+                        continue;
+
+
+                    string name =
+                        row.Cells[1]
+                            .Value?
+                            .ToString()
+                        ?? "";
+
+
+                    bool completed =
+                        false;
+
+
+                    if (row.Cells[0].Value != null)
+                    {
+                        bool.TryParse(
+                            row.Cells[0]
+                                .Value
+                                .ToString(),
+                            out completed);
+                    }
+
+
+                    if (!string.IsNullOrWhiteSpace(name))
+                    {
+                        data.Tasks.Add(
+                            new PlannerTask
+                            {
+                                Name = name,
+
+                                Completed =
+                                    completed
+                            });
+                    }
+                }
+            }
+
+
+            // 시간표 저장
+            if (dgvTimeTable != null)
+            {
+                for (
+                    int i = 0;
+                    i < dgvTimeTable.Rows.Count;
+                    i++)
+                {
+                    var rowInfo =
+                        dgvTimeTable.Rows[i].Tag
+                        as RowTimeInfo;
+
+
+                    if (rowInfo != null)
+                    {
+                        foreach (
+                            var b
+                            in rowInfo.Blocks)
+                        {
+                            var slot =
+                                new PlannerTimeSlot
+                                {
+                                    Hour =
+                                        rowInfo.RealHour,
+
+                                    TaskName =
+                                        b.TaskName,
+
+                                    R =
+                                        b.R,
+
+                                    G =
+                                        b.G,
+
+                                    B =
+                                        b.B
+                                };
+
+
+                            var propStart =
+                                typeof(PlannerTimeSlot)
+                                    .GetProperty(
+                                        "StartMinute")
+                                ??
+                                typeof(PlannerTimeSlot)
+                                    .GetProperty(
+                                        "StartMin");
+
+
+                            var propEnd =
+                                typeof(PlannerTimeSlot)
+                                    .GetProperty(
+                                        "EndMinute")
+                                ??
+                                typeof(PlannerTimeSlot)
+                                    .GetProperty(
+                                        "EndMin");
+
+
+                            if (propStart != null)
+                            {
+                                propStart.SetValue(
+                                    slot,
+                                    b.StartMinute);
+                            }
+
+
+                            if (propEnd != null)
+                            {
+                                propEnd.SetValue(
+                                    slot,
+                                    b.EndMinute);
+                            }
+
+
+                            data.TimeSlots.Add(
+                                slot);
+                        }
+                    }
+                }
+            }
+
+
+            if (
+                data.Tasks.Count > 0 ||
+                data.TimeSlots.Count > 0)
+            {
+                plannerMap[key] =
+                    data;
+            }
+            else
+            {
+                plannerMap.Remove(key);
+            }
+
+
+            try
+            {
+                plannerDbRepository.Save(
+                    loggedInUserId,
+                    currentDate,
+                    data);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    $"플래너를 DB에 저장하지 못했습니다.\n\n{ex.Message}",
+                    "DB 저장 오류",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+        }
+
+
+        // ============================================================
+        // 현재 테마 적용
+        // ============================================================
+        public void ApplyCurrentTheme()
+        {
+            // PlannerControl 전체
+            BackColor =
+                UiThemeService.BackgroundColor;
+
+            ForeColor =
+                UiThemeService.TextColor;
+
+
+            // 기본 컨트롤들을 먼저 재귀적으로 적용
+            UiThemeService.ApplyTheme(this);
+
+
+            // --------------------------------------------------------
+            // 체크리스트
+            // --------------------------------------------------------
+            if (dgvTodoList != null)
+            {
+                dgvTodoList.BackgroundColor =
+                    UiThemeService.InputColor;
+
+                dgvTodoList.GridColor =
+                    GetPlannerGridColor();
+
+                dgvTodoList.BorderStyle =
+                    BorderStyle.FixedSingle;
+
+
+                dgvTodoList.DefaultCellStyle.BackColor =
+                    UiThemeService.InputColor;
+
+                dgvTodoList.DefaultCellStyle.ForeColor =
+                    UiThemeService.TextColor;
+
+
+                // 체크리스트 선택 시 파란색 방지
+                dgvTodoList.DefaultCellStyle.SelectionBackColor =
+                    UiThemeService.InputColor;
+
+                dgvTodoList.DefaultCellStyle.SelectionForeColor =
+                    UiThemeService.TextColor;
+
+
+                // 체크리스트 헤더
+                dgvTodoList.ColumnHeadersDefaultCellStyle.BackColor =
+                    UiThemeService.SurfaceColor;
+
+                dgvTodoList.ColumnHeadersDefaultCellStyle.ForeColor =
+                    UiThemeService.TextColor;
+
+                dgvTodoList.ColumnHeadersDefaultCellStyle.SelectionBackColor =
+                    UiThemeService.SurfaceColor;
+
+                dgvTodoList.ColumnHeadersDefaultCellStyle.SelectionForeColor =
+                    UiThemeService.TextColor;
+
+
+                dgvTodoList.EnableHeadersVisualStyles =
+                    false;
+
+
+                dgvTodoList.Invalidate();
+            }
+
+
+            // --------------------------------------------------------
+            // 스터디 타임테이블
+            // --------------------------------------------------------
+            if (dgvTimeTable != null)
+            {
+                dgvTimeTable.BackgroundColor =
+                    UiThemeService.InputColor;
+
+                dgvTimeTable.DefaultCellStyle.BackColor =
+                    UiThemeService.InputColor;
+
+                dgvTimeTable.DefaultCellStyle.ForeColor =
+                    UiThemeService.TextColor;
+
+                dgvTimeTable.DefaultCellStyle.SelectionBackColor =
+                    UiThemeService.InputColor;
+
+                dgvTimeTable.DefaultCellStyle.SelectionForeColor =
+                    UiThemeService.TextColor;
+
+                dgvTimeTable.GridColor =
+                    GetPlannerGridColor();
+
+
+                dgvTimeTable.ClearSelection();
+
+                dgvTimeTable.Invalidate();
+            }
+
+
+            // --------------------------------------------------------
+            // 입력창
+            // --------------------------------------------------------
+            if (txtTaskInput != null)
+            {
+                txtTaskInput.BackColor =
+                    UiThemeService.InputColor;
+
+                txtTaskInput.ForeColor =
+                    UiThemeService.TextColor;
+            }
+
+
+            // --------------------------------------------------------
+            // 할 일 선택
+            // --------------------------------------------------------
+            if (cbTaskList != null)
+            {
+                cbTaskList.BackColor =
+                    UiThemeService.InputColor;
+
+                cbTaskList.ForeColor =
+                    UiThemeService.TextColor;
+            }
+
+
+            // --------------------------------------------------------
+            // 형광펜 색 선택
+            // --------------------------------------------------------
+            if (cbColorPicker != null)
+            {
+                cbColorPicker.BackColor =
+                    UiThemeService.InputColor;
+
+                cbColorPicker.ForeColor =
+                    UiThemeService.TextColor;
+
+                // 테마가 바뀌면 형광펜 이름과 미리보기 색도 즉시 갱신
+                RefreshHighlightColorCombo();
+            }
+
+
+            // --------------------------------------------------------
+            // 시작 / 종료 시간
+            // --------------------------------------------------------
+            if (dtpStart != null)
+            {
+                dtpStart.CalendarForeColor =
+                    UiThemeService.TextColor;
+
+                dtpStart.CalendarMonthBackground =
+                    UiThemeService.InputColor;
+            }
+
+
+            if (dtpEnd != null)
+            {
+                dtpEnd.CalendarForeColor =
+                    UiThemeService.TextColor;
+
+                dtpEnd.CalendarMonthBackground =
+                    UiThemeService.InputColor;
+            }
+
+
+            // 화면 다시 그리기
+            Invalidate();
+        }
+
+
+        // ============================================================
+        // 현재 선택된 글꼴을 플래너에 적용
+        // ============================================================
+        public void ApplyCurrentFont()
+        {
+            SuspendLayout();
+
+            try
+            {
+                if (dgvTodoList != null)
+                {
+                    dgvTodoList.DefaultCellStyle.Font =
+                        AppFontService.CreateFont(
+                            dgvTodoList.DefaultCellStyle.Font?.Size ?? 9F,
+                            dgvTodoList.DefaultCellStyle.Font?.Style
+                                ?? FontStyle.Regular);
+
+                    dgvTodoList.ColumnHeadersDefaultCellStyle.Font =
+                        AppFontService.CreateFont(
+                            dgvTodoList.ColumnHeadersDefaultCellStyle.Font?.Size ?? 9F,
+                            dgvTodoList.ColumnHeadersDefaultCellStyle.Font?.Style
+                                ?? FontStyle.Bold);
+
+                    dgvTodoList.Invalidate();
+                }
+
+                if (dgvTimeTable != null)
+                {
+                    dgvTimeTable.Font =
+                        AppFontService.CreateFont(
+                            dgvTimeTable.Font.Size,
+                            dgvTimeTable.Font.Style);
+
+                    dgvTimeTable.DefaultCellStyle.Font =
+                        AppFontService.CreateFont(
+                            dgvTimeTable.DefaultCellStyle.Font?.Size ?? 9F,
+                            dgvTimeTable.DefaultCellStyle.Font?.Style
+                                ?? FontStyle.Regular);
+
+                    dgvTimeTable.Invalidate();
+                }
+
+                if (txtTaskInput != null)
+                {
+                    Rectangle oldBounds = txtTaskInput.Bounds;
+
+                    txtTaskInput.Font =
+                        AppFontService.CreateFont(
+                            txtTaskInput.Font.Size,
+                            txtTaskInput.Font.Style);
+
+                    txtTaskInput.Bounds = oldBounds;
+                }
+
+                if (cbTaskList != null)
+                {
+                    Rectangle oldBounds = cbTaskList.Bounds;
+
+                    cbTaskList.Font =
+                        AppFontService.CreateFont(
+                            cbTaskList.Font.Size,
+                            cbTaskList.Font.Style);
+
+                    cbTaskList.Bounds = oldBounds;
+                }
+
+                if (cbColorPicker != null)
+                {
+                    Rectangle oldBounds = cbColorPicker.Bounds;
+
+                    cbColorPicker.Font =
+                        AppFontService.CreateFont(
+                            cbColorPicker.Font.Size,
+                            cbColorPicker.Font.Style);
+
+                    cbColorPicker.Bounds = oldBounds;
+                }
+
+                if (dtpStart != null)
+                {
+                    Rectangle oldBounds = dtpStart.Bounds;
+
+                    dtpStart.Font =
+                        AppFontService.CreateFont(
+                            dtpStart.Font.Size,
+                            dtpStart.Font.Style);
+
+                    dtpStart.Bounds = oldBounds;
+                }
+
+                if (dtpEnd != null)
+                {
+                    Rectangle oldBounds = dtpEnd.Bounds;
+
+                    dtpEnd.Font =
+                        AppFontService.CreateFont(
+                            dtpEnd.Font.Size,
+                            dtpEnd.Font.Style);
+
+                    dtpEnd.Bounds = oldBounds;
+                }
+
+                Invalidate();
+            }
+            finally
+            {
+                ResumeLayout(false);
+            }
+        }
+
+
+        // ============================================================
+        // 형광펜 색상 콤보박스 초기화
+        // ============================================================
+        private void InitializeHighlightColorCombo()
+        {
+            if (cbColorPicker == null)
+                return;
+
+            cbColorPicker.DrawMode =
+                DrawMode.OwnerDrawFixed;
+
+            cbColorPicker.DropDownStyle =
+                ComboBoxStyle.DropDownList;
+
+            cbColorPicker.DrawItem -=
+                CbColorPicker_DrawItem;
+
+            cbColorPicker.DrawItem +=
+                CbColorPicker_DrawItem;
+
+            RefreshHighlightColorCombo();
+        }
+
+
+        // ============================================================
+        // 현재 테마에 맞춰 형광펜 선택 항목 갱신
+        // ============================================================
+        private void RefreshHighlightColorCombo()
+        {
+            if (cbColorPicker == null)
+                return;
+
+            int oldIndex =
+                cbColorPicker.SelectedIndex;
+
+            if (oldIndex < 0 ||
+                oldIndex > 4)
+            {
+                oldIndex = 0;
+            }
+
+            string[] names =
+                GetHighlightColorNames();
+
+            cbColorPicker.BeginUpdate();
+
+            try
+            {
+                cbColorPicker.Items.Clear();
+
+                foreach (string name in names)
+                {
+                    cbColorPicker.Items.Add(name);
+                }
+
+                if (cbColorPicker.Items.Count > 0)
+                {
+                    cbColorPicker.SelectedIndex =
+                        Math.Min(
+                            oldIndex,
+                            cbColorPicker.Items.Count - 1);
+                }
+            }
+            finally
+            {
+                cbColorPicker.EndUpdate();
+            }
+
+            cbColorPicker.Invalidate();
+        }
+
+
+        // ============================================================
+        // 형광펜 콤보박스에 색상 미리보기 + 이름 표시
+        // ============================================================
+        private void CbColorPicker_DrawItem(
+            object sender,
+            DrawItemEventArgs e)
+        {
+            if (e.Index < 0 ||
+                cbColorPicker == null)
+            {
+                return;
+            }
+
+            e.DrawBackground();
+
+            Color previewColor =
+                GetThemeHighlightColorByIndex(
+                    e.Index);
+
+            Rectangle colorBox =
+                new Rectangle(
+                    e.Bounds.Left + 5,
+                    e.Bounds.Top + 4,
+                    18,
+                    Math.Max(
+                        10,
+                        e.Bounds.Height - 8));
+
+            using (SolidBrush colorBrush =
+                   new SolidBrush(previewColor))
+            {
+                e.Graphics.FillRectangle(
+                    colorBrush,
+                    colorBox);
+            }
+
+            using (Pen borderPen =
+                   new Pen(GetPlannerGridColor()))
+            {
+                e.Graphics.DrawRectangle(
+                    borderPen,
+                    colorBox);
+            }
+
+            Rectangle textRect =
+                new Rectangle(
+                    colorBox.Right + 7,
+                    e.Bounds.Top,
+                    Math.Max(
+                        1,
+                        e.Bounds.Width -
+                        colorBox.Width - 17),
+                    e.Bounds.Height);
+
+            Color textColor =
+                (e.State & DrawItemState.Selected) != 0
+                    ? SystemColors.HighlightText
+                    : UiThemeService.TextColor;
+
+            TextRenderer.DrawText(
+                e.Graphics,
+                cbColorPicker.Items[e.Index]?.ToString() ?? "",
+                e.Font ?? cbColorPicker.Font,
+                textRect,
+                textColor,
+                TextFormatFlags.Left |
+                TextFormatFlags.VerticalCenter);
+
+            e.DrawFocusRectangle();
+        }
+
+
+        // ============================================================
+        // 테마별 형광펜 표시 이름
+        // ============================================================
+        private string[] GetHighlightColorNames()
+        {
+            return UiThemeService.CurrentTheme switch
+            {
+                AppTheme.Dark =>
+                    new[]
+                    {
+                        "더스티 로즈",
+                        "골드",
+                        "세이지",
+                        "딥 블루",
+                        "뮤트 퍼플"
+                    },
+
+                AppTheme.Blossom =>
+                    new[]
+                    {
+                        "벚꽃 핑크",
+                        "피치 크림",
+                        "새싹 그린",
+                        "봄 하늘",
+                        "라일락"
+                    },
+
+                AppTheme.Mint =>
+                    new[]
+                    {
+                        "민트 크림",
+                        "아이보리",
+                        "민트",
+                        "아쿠아",
+                        "세이지"
+                    },
+
+                AppTheme.Lavender =>
+                    new[]
+                    {
+                        "라일락 핑크",
+                        "바닐라",
+                        "세이지",
+                        "페리윙클",
+                        "라벤더"
+                    },
+
+                AppTheme.Cozy =>
+                    new[]
+                    {
+                        "살구",
+                        "카멜",
+                        "올리브",
+                        "웜 그레이",
+                        "브라운 로즈"
+                    },
+
+                _ =>
+                    new[]
+                    {
+                        "핑크",
+                        "노랑",
+                        "연두",
+                        "하늘",
+                        "보라"
+                    }
+            };
+        }
+
+
+        // ============================================================
+        // DB 저장용 기존 5색 RGB
+        // ============================================================
+        private Color GetBaseHighlightColor(
+            int index)
+        {
+            return index switch
+            {
+                0 => Color.FromArgb(244, 180, 190),
+                1 => Color.FromArgb(250, 220, 150),
+                2 => Color.FromArgb(170, 215, 175),
+                3 => Color.FromArgb(165, 205, 235),
+                4 => Color.FromArgb(215, 185, 225),
+
+                _ => Color.FromArgb(244, 180, 190)
+            };
+        }
+
+
+        // ============================================================
+        // 실제 화면에 사용할 테마별 5색
+        // ============================================================
+        private Color GetThemeHighlightColorByIndex(
+            int index)
+        {
+            return UiThemeService.CurrentTheme switch
+            {
+                AppTheme.Dark => index switch
+                {
+                    0 => Color.FromArgb(183, 105, 132),
+                    1 => Color.FromArgb(190, 158, 82),
+                    2 => Color.FromArgb(103, 158, 122),
+                    3 => Color.FromArgb(92, 139, 177),
+                    4 => Color.FromArgb(143, 112, 177),
+                    _ => GetBaseHighlightColor(index)
+                },
+
+                AppTheme.Blossom => index switch
+                {
+                    0 => Color.FromArgb(247, 174, 196),
+                    1 => Color.FromArgb(250, 218, 174),
+                    2 => Color.FromArgb(205, 225, 190),
+                    3 => Color.FromArgb(196, 214, 235),
+                    4 => Color.FromArgb(221, 190, 228),
+                    _ => GetBaseHighlightColor(index)
+                },
+
+                AppTheme.Mint => index switch
+                {
+                    0 => Color.FromArgb(202, 225, 207),
+                    1 => Color.FromArgb(235, 229, 178),
+                    2 => Color.FromArgb(151, 215, 187),
+                    3 => Color.FromArgb(158, 211, 218),
+                    4 => Color.FromArgb(184, 210, 204),
+                    _ => GetBaseHighlightColor(index)
+                },
+
+                AppTheme.Lavender => index switch
+                {
+                    0 => Color.FromArgb(231, 184, 215),
+                    1 => Color.FromArgb(235, 220, 188),
+                    2 => Color.FromArgb(197, 210, 198),
+                    3 => Color.FromArgb(184, 199, 232),
+                    4 => Color.FromArgb(202, 174, 229),
+                    _ => GetBaseHighlightColor(index)
+                },
+
+                AppTheme.Cozy => index switch
+                {
+                    0 => Color.FromArgb(221, 168, 154),
+                    1 => Color.FromArgb(226, 194, 135),
+                    2 => Color.FromArgb(178, 192, 145),
+                    3 => Color.FromArgb(171, 188, 190),
+                    4 => Color.FromArgb(190, 161, 174),
+                    _ => GetBaseHighlightColor(index)
+                },
+
+                _ =>
+                    GetBaseHighlightColor(index)
+            };
+        }
+
+
+        // ============================================================
+        // DB의 기존 형광펜 RGB를 현재 테마 색으로 변환
+        // ============================================================
+        private Color GetThemedHighlightColor(
+            Color original)
+        {
+            int index =
+                GetHighlightColorIndex(
+                    original);
+
+            if (index < 0)
+                return original;
+
+            return GetThemeHighlightColorByIndex(
+                index);
+        }
+
+
+        private int GetHighlightColorIndex(
+            Color color)
+        {
+            for (int i = 0;
+                 i < 5;
+                 i++)
+            {
+                if (IsNearHighlightColor(
+                    color,
+                    GetBaseHighlightColor(i)))
+                {
+                    return i;
+                }
+            }
+
+            return -1;
+        }
+
+
+        private bool IsNearHighlightColor(
+            Color a,
+            Color b)
+        {
+            const int tolerance = 15;
+
+            return
+                Math.Abs(a.R - b.R) <= tolerance &&
+                Math.Abs(a.G - b.G) <= tolerance &&
+                Math.Abs(a.B - b.B) <= tolerance;
+        }
+
+
+        // ============================================================
+        // 플래너 테두리 / 격자선 색
+        // ============================================================
+        private Color GetPlannerGridColor()
+        {
+            return UiThemeService.CurrentTheme switch
+            {
+                AppTheme.Dark =>
+                    Color.FromArgb(
+                        75,
+                        75,
+                        75),
+
+                AppTheme.Blossom =>
+                    Color.FromArgb(
+                        243,
+                        198,
+                        212),
+
+                AppTheme.Mint =>
+                    Color.FromArgb(
+                        190,
+                        225,
+                        213),
+
+                AppTheme.Lavender =>
+                    Color.FromArgb(
+                        210,
+                        198,
+                        235),
+
+                AppTheme.Cozy =>
+                    Color.FromArgb(
+                        220,
+                        202,
+                        180),
+
+                _ =>
+                    Color.FromArgb(
+                        210,
+                        210,
+                        210)
+            };
+        }
+
+
+        // ============================================================
+        // 타임테이블 안의 할 일 글씨
+        // 형광펜 위에서 보이도록 별도 처리
+        // ============================================================
+        private Color GetTimeBlockTextColor()
+        {
+            return UiThemeService.CurrentTheme switch
+            {
+                AppTheme.Dark =>
+                    Color.FromArgb(
+                        245,
+                        245,
+                        245),
+
+                _ =>
+                    Color.FromArgb(
+                        55,
+                        50,
+                        55)
+            };
+        }
+
+
+        // ============================================================
+        // 컨트롤 종료 전 저장
+        // ============================================================
+        protected override void OnHandleDestroyed(
+            EventArgs e)
+        {
+            SaveCurrentPlanner();
+
+            base.OnHandleDestroyed(e);
+        }
+    }
+
+
+    // ================================================================
+    // 타임테이블 행 정보
+    // ================================================================
+    public class RowTimeInfo
+    {
+        public int RealHour { get; set; }
+
+        public List<TimeBlock> Blocks { get; set; } =
+            new List<TimeBlock>();
+    }
+
+
+    // ================================================================
+    // 타임테이블 색칠 블록
+    // ================================================================
+    public class TimeBlock
+    {
+        public int StartMinute { get; set; }
+
+        public int EndMinute { get; set; }
+
+        public string TaskName { get; set; } =
+            string.Empty;
+
+        public int R { get; set; }
+
+        public int G { get; set; }
+
+        public int B { get; set; }
+    }
+}

@@ -1,0 +1,29 @@
+# Visual Studio / .NET build outputs
+.vs/
+[Bb]in/
+[Oo]bj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Build / debug artifacts
+*.pdb
+*.cache
+*.log
+
+# Local runtime data
+saved_*.json
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local secret/config files
+.env
+.env.*
+!.env.example
+appsettings.Local.json
+secrets.json
